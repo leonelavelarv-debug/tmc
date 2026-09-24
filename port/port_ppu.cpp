@@ -89,6 +89,12 @@ static constexpr int kMaxInternalScale = 10;
 static constexpr size_t kMaxScaledPixels =
     (size_t)MODE1_GBA_WIDTH * (size_t)MODE1_GBA_HEIGHT * (size_t)kMaxInternalScale * (size_t)kMaxInternalScale;
 alignas(64) static uint32_t sScaledBufStorage[kMaxScaledPixels];
+/* Some ARM handheld framebuffer stacks advertise the SDL software renderer
+ * but cannot sample ABGR8888 streaming textures correctly (the clear colour
+ * is visible while the game texture is a solid/blank rectangle).  Keep a
+ * separate conversion buffer so the opt-in evdev path can upload ARGB8888,
+ * which is supported by the RG35XX H software renderer. */
+alignas(64) static uint32_t sEvdevCompatBuf[kMaxScaledPixels];
 static int sScaledBufW = 0;
 static int sScaledBufH = 0;
 static int sScaledBufScale = 0;
@@ -186,6 +192,48 @@ static SDL_Texture* sTextureScaleModeTexture = nullptr;
 static SDL_ScaleMode sTextureScaleMode = SDL_SCALEMODE_NEAREST;
 static bool sTextureScaleModeValid = false;
 
+static bool Port_PPU_EvdevCompat(void) {
+    static const bool enabled = []() {
+        const char* value = std::getenv("TMC_EVDEV_COMPAT");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool Port_PPU_UpdateTexture(SDL_Texture* texture, const uint32_t* pixels, int w, int h, int pitchBytes) {
+    const void* uploadPixels = pixels;
+    int uploadPitch = pitchBytes;
+
+    if (Port_PPU_EvdevCompat()) {
+        const size_t pixelCount = (size_t)w * (size_t)h;
+        if (pixelCount > kMaxScaledPixels) {
+            fprintf(stderr, "[ppu] evdev conversion buffer too small for %dx%d\n", w, h);
+            return false;
+        }
+        const int srcPitch = pitchBytes / (int)sizeof(uint32_t);
+        for (int y = 0; y < h; ++y) {
+            const uint32_t* src = pixels + (size_t)y * (size_t)srcPitch;
+            uint32_t* dst = sEvdevCompatBuf + (size_t)y * (size_t)w;
+            for (int x = 0; x < w; ++x) {
+                const uint32_t p = src[x];
+                dst[x] = (p & 0xff00ff00u) | ((p & 0x000000ffu) << 16) | ((p & 0x00ff0000u) >> 16);
+            }
+        }
+        uploadPixels = sEvdevCompatBuf;
+        uploadPitch = w * (int)sizeof(uint32_t);
+    }
+
+    if (!SDL_UpdateTexture(texture, nullptr, uploadPixels, uploadPitch)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[ppu] SDL_UpdateTexture FAILED (%dx%d): %s\n", w, h, SDL_GetError());
+        }
+        return false;
+    }
+    return true;
+}
+
 static void Port_PPU_InvalidateTextureScaleMode(SDL_Texture* tex) {
     if (sTextureScaleModeTexture == tex) {
         sTextureScaleModeTexture = nullptr;
@@ -217,10 +265,15 @@ static SDL_Texture* Port_PPU_EnsureTexture(SDL_Texture** slot, int* curW, int* c
     }
     *curW = 0;
     *curH = 0;
-    *slot = SDL_CreateTexture(sRenderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+    const SDL_PixelFormat format = Port_PPU_EvdevCompat() ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_ABGR8888;
+    *slot = SDL_CreateTexture(sRenderer, format, SDL_TEXTUREACCESS_STREAMING, w, h);
     if (*slot != nullptr) {
+        SDL_SetTextureBlendMode(*slot, SDL_BLENDMODE_NONE);
         *curW = w;
         *curH = h;
+        if (Port_PPU_EvdevCompat()) {
+            fprintf(stderr, "[ppu] evdev compatibility texture: ARGB8888 %dx%d\n", w, h);
+        }
     }
     return *slot;
 }
@@ -1571,7 +1624,7 @@ extern "C" void Port_PPU_PresentFrame(void) {
                                                    presentPitchBytes / (int)sizeof(uint32_t), sUpscale2xBuf,
                                                    sUpscale4xBuf);
                         Port_Filter_Apply(sUpscale4xBuf, hiW, hiH, 4, sFilter);
-                        SDL_UpdateTexture(hiTex, nullptr, sUpscale4xBuf, hiW * (int)sizeof(uint32_t));
+                        Port_PPU_UpdateTexture(hiTex, sUpscale4xBuf, hiW, hiH, hiW * (int)sizeof(uint32_t));
                         tex = hiTex;
                     }
                 }
@@ -1580,7 +1633,7 @@ extern "C" void Port_PPU_PresentFrame(void) {
                         Port_PPU_EnsureTexture(&sLowResTexture, &sLowResTextureW, &sLowResTextureH, presentW, presentH);
                     if (rawTex == nullptr)
                         return;
-                    SDL_UpdateTexture(rawTex, nullptr, presentFrame, presentPitchBytes);
+                    Port_PPU_UpdateTexture(rawTex, presentFrame, presentW, presentH, presentPitchBytes);
                     tex = rawTex;
                 }
                 scale = (sPresentMode == PresentMode::XbrzLinear) ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
@@ -1602,14 +1655,14 @@ extern "C" void Port_PPU_PresentFrame(void) {
                 SDL_Texture* scaledTex = scaled ? Port_PPU_EnsureScaledTexture(sw, sh, effScale) : nullptr;
                 if (scaled && scaledTex) {
                     Port_Filter_Apply(scaled, sw, sh, effScale, sFilter);
-                    SDL_UpdateTexture(scaledTex, nullptr, scaled, sw * (int)sizeof(uint32_t));
+                    Port_PPU_UpdateTexture(scaledTex, scaled, sw, sh, sw * (int)sizeof(uint32_t));
                     tex = scaledTex;
                 } else {
                     SDL_Texture* rawTex =
                         Port_PPU_EnsureTexture(&sLowResTexture, &sLowResTextureW, &sLowResTextureH, presentW, presentH);
                     if (rawTex == nullptr)
                         return;
-                    SDL_UpdateTexture(rawTex, nullptr, presentFrame, presentPitchBytes);
+                    Port_PPU_UpdateTexture(rawTex, presentFrame, presentW, presentH, presentPitchBytes);
                     tex = rawTex;
                 }
                 scale = (sPresentMode == PresentMode::LinearRaw) ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
@@ -1638,7 +1691,13 @@ extern "C" void Port_PPU_PresentFrame(void) {
         }
 
         Port_PPU_SetTextureScaleModeCached(tex, scale);
-        SDL_RenderTexture(sRenderer, tex, nullptr, &dst);
+        if (!SDL_RenderTexture(sRenderer, tex, nullptr, &dst)) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "[ppu] SDL_RenderTexture FAILED: %s\n", SDL_GetError());
+            }
+        }
         {
             /* Try the ImGui-based menu first; if disabled (or init
              * failed), fall back to the legacy SDL_RenderDebugText
