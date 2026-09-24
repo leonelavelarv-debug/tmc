@@ -12,7 +12,7 @@ on:
   # targets: Linux/Windows/macOS x86_64 and Linux/Windows/macOS ARM64.
   workflow_dispatch:
     inputs:
-      os_filter:
+      os_filter: linux-arm
         description: "Platform filter"
         required: false
         type: choice
@@ -55,7 +55,7 @@ jobs:
       publish_mode: artifact
       version_label: ${{ needs.meta.outputs.stamp }}
       # Empty on push/PR -> _build.yaml defaults to "all"; set on manual runs.
-      os_filter: ${{ inputs.os_filter || 'all' }}
+      os_filter: linux-arm
     secrets:
       ASSETS_TOKEN: ${{ secrets.ASSETS_TOKEN }}
       PRIVATE_SUBMODULES_TOKEN: ${{ secrets.PRIVATE_SUBMODULES_TOKEN }}
