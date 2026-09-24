@@ -1717,6 +1717,16 @@ extern "C" void Port_PPU_PresentFrame(void) {
     }
 
     if (sBackend == RenderBackend::Renderer) {
+        /* On direct-fbdev handhelds SDL's evdev software presenter and our
+         * framebuffer writer target the same scanout memory. Presenting both
+         * makes the LCD alternate between SDL's blank stage and the game.
+         * Bypass every SDL draw/present operation and make fbdev the sole
+         * owner of scanout for this frame. */
+        const char* directFb = std::getenv("TMC_FBDEV_DIRECT");
+        if (directFb != nullptr && directFb[0] != '\0' && std::strcmp(directFb, "0") != 0) {
+            Port_PPU_PresentDirectFb(presentFrame, presentW, presentH, presentPitchBytes);
+            return;
+        }
         int outW = 0;
         int outH = 0;
         Port_PPU_QueryOutputSize(&outW, &outH);
