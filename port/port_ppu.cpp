@@ -122,6 +122,8 @@ struct PortDirectFb {
     size_t size = 0;
     fb_fix_screeninfo fix = {};
     fb_var_screeninfo var = {};
+    uint8_t* staging = nullptr;
+    size_t stagingSize = 0;
     bool tried = false;
 };
 static PortDirectFb sDirectFb;
@@ -180,7 +182,8 @@ static bool Port_PPU_DirectFbInit(void) {
 static void Port_PPU_PresentDirectFb(const uint32_t* src, int srcW, int srcH, int srcPitchBytes) {
     if (!Port_PPU_DirectFbInit() || src == nullptr || srcW <= 0 || srcH <= 0)
         return;
-    /* SDL's evdev presenter may page-flip, so refresh the visible offset. */
+    /* Refresh the geometry because the display driver may still change its
+     * visible page behind our back. */
     ioctl(sDirectFb.fd, FBIOGET_VSCREENINFO, &sDirectFb.var);
     const int fbW = (int)sDirectFb.var.xres;
     const int fbH = (int)sDirectFb.var.yres;
@@ -193,23 +196,37 @@ static void Port_PPU_PresentDirectFb(const uint32_t* src, int srcW, int srcH, in
     }
     const int dstX = (fbW - dstW) / 2;
     const int dstY = (fbH - dstH) / 2;
-    const size_t pageOffset = (size_t)sDirectFb.var.yoffset * sDirectFb.fix.line_length +
-                              (size_t)sDirectFb.var.xoffset * (size_t)bytesPerPixel;
-    if (pageOffset >= sDirectFb.size)
-        return;
-    uint8_t* page = sDirectFb.pixels + pageOffset;
     const size_t visibleBytes = (size_t)fbH * sDirectFb.fix.line_length;
-    if (pageOffset + visibleBytes <= sDirectFb.size)
-        std::memset(page, 0, visibleBytes);
+    if (visibleBytes == 0 || visibleBytes > sDirectFb.size)
+        return;
+    if (sDirectFb.stagingSize < visibleBytes) {
+        void* resized = std::realloc(sDirectFb.staging, visibleBytes);
+        if (resized == nullptr)
+            return;
+        sDirectFb.staging = static_cast<uint8_t*>(resized);
+        sDirectFb.stagingSize = visibleBytes;
+    }
+    std::memset(sDirectFb.staging, 0, visibleBytes);
 
     const int srcPitch = srcPitchBytes / (int)sizeof(uint32_t);
+    const bool fastXrgb8888 = bytesPerPixel == 4 && sDirectFb.var.red.offset == 16 &&
+                              sDirectFb.var.red.length == 8 && sDirectFb.var.green.offset == 8 &&
+                              sDirectFb.var.green.length == 8 && sDirectFb.var.blue.offset == 0 &&
+                              sDirectFb.var.blue.length == 8;
     for (int dy = 0; dy < dstH; ++dy) {
         const int sy = (dy * srcH) / dstH;
         const uint32_t* srcRow = src + (size_t)sy * (size_t)srcPitch;
-        uint8_t* dstRow = page + (size_t)(dstY + dy) * sDirectFb.fix.line_length +
+        uint8_t* dstRow = sDirectFb.staging + (size_t)(dstY + dy) * sDirectFb.fix.line_length +
                           (size_t)dstX * (size_t)bytesPerPixel;
         for (int dx = 0; dx < dstW; ++dx) {
             const uint32_t p = srcRow[(dx * srcW) / dstW];
+            if (fastXrgb8888) {
+                /* Core pixels are ABGR8888; fb0 is XRGB8888 on the RG35XX H. */
+                reinterpret_cast<uint32_t*>(dstRow)[dx] =
+                    0xff000000u | ((p & 0x000000ffu) << 16) | (p & 0x0000ff00u) |
+                    ((p & 0x00ff0000u) >> 16);
+                continue;
+            }
             const uint8_t r = (uint8_t)p;
             const uint8_t g = (uint8_t)(p >> 8);
             const uint8_t b = (uint8_t)(p >> 16);
@@ -224,6 +241,19 @@ static void Port_PPU_PresentDirectFb(const uint32_t* src, int srcW, int srcH, in
                 reinterpret_cast<uint32_t*>(dstRow)[dx] = packed;
         }
     }
+
+    /* fb0 is 640x960 on this device: two 640x480 scanout pages.  The kernel's
+     * display stack can continue alternating those pages even though SDL
+     * RenderPresent is bypassed.  Publish the fully rendered frame to every
+     * complete page so either yoffset displays identical pixels. */
+    size_t pageCount = (size_t)sDirectFb.var.yres_virtual / (size_t)fbH;
+    const size_t mappedPages = sDirectFb.size / visibleBytes;
+    if (pageCount > mappedPages)
+        pageCount = mappedPages;
+    if (pageCount == 0)
+        pageCount = 1;
+    for (size_t pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+        std::memcpy(sDirectFb.pixels + pageIndex * visibleBytes, sDirectFb.staging, visibleBytes);
 }
 #else
 static void Port_PPU_PresentDirectFb(const uint32_t*, int, int, int) {}
