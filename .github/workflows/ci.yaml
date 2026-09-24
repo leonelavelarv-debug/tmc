@@ -12,7 +12,7 @@ on:
   # targets: Linux/Windows/macOS x86_64 and Linux/Windows/macOS ARM64.
   workflow_dispatch:
     inputs:
-      os_filter: linux-arm
+      os_filter:
         description: "Platform filter"
         required: false
         type: choice
