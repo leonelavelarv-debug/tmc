@@ -25,6 +25,14 @@
 #include <cstring>
 #include <cmath>
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #if defined(__clang__) || defined(__INTEL_COMPILER)
@@ -106,6 +114,120 @@ static bool sSuperValid = false;
 static int sSuperW = 0;
 static int sSuperH = 0;
 static SDL_Window* sWindow = nullptr;
+
+#if defined(__linux__) && !defined(__ANDROID__)
+struct PortDirectFb {
+    int fd = -1;
+    uint8_t* pixels = nullptr;
+    size_t size = 0;
+    fb_fix_screeninfo fix = {};
+    fb_var_screeninfo var = {};
+    bool tried = false;
+};
+static PortDirectFb sDirectFb;
+
+static uint32_t Port_PPU_FbComponent(uint8_t value, const fb_bitfield& field) {
+    if (field.length == 0)
+        return 0;
+    const uint32_t maxValue = (field.length >= 32) ? 0xffffffffu : ((1u << field.length) - 1u);
+    return (((uint32_t)value * maxValue + 127u) / 255u) << field.offset;
+}
+
+static bool Port_PPU_DirectFbInit(void) {
+    if (sDirectFb.tried)
+        return sDirectFb.pixels != nullptr;
+    sDirectFb.tried = true;
+    const char* enabled = std::getenv("TMC_FBDEV_DIRECT");
+    if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0)
+        return false;
+    const char* path = std::getenv("TMC_FBDEV_PATH");
+    if (path == nullptr || path[0] == '\0')
+        path = "/dev/fb0";
+    sDirectFb.fd = open(path, O_RDWR | O_CLOEXEC);
+    if (sDirectFb.fd < 0 || ioctl(sDirectFb.fd, FBIOGET_FSCREENINFO, &sDirectFb.fix) < 0 ||
+        ioctl(sDirectFb.fd, FBIOGET_VSCREENINFO, &sDirectFb.var) < 0) {
+        fprintf(stderr, "[fbdev] cannot open/query %s\n", path);
+        if (sDirectFb.fd >= 0)
+            close(sDirectFb.fd);
+        sDirectFb.fd = -1;
+        return false;
+    }
+    if (sDirectFb.var.bits_per_pixel != 16 && sDirectFb.var.bits_per_pixel != 32) {
+        fprintf(stderr, "[fbdev] unsupported bpp: %u\n", sDirectFb.var.bits_per_pixel);
+        close(sDirectFb.fd);
+        sDirectFb.fd = -1;
+        return false;
+    }
+    sDirectFb.size = sDirectFb.fix.smem_len;
+    void* mapped = mmap(nullptr, sDirectFb.size, PROT_READ | PROT_WRITE, MAP_SHARED, sDirectFb.fd, 0);
+    if (mapped == MAP_FAILED) {
+        fprintf(stderr, "[fbdev] mmap failed for %s\n", path);
+        close(sDirectFb.fd);
+        sDirectFb.fd = -1;
+        return false;
+    }
+    sDirectFb.pixels = static_cast<uint8_t*>(mapped);
+    fprintf(stderr,
+            "[fbdev] direct output enabled: %ux%u virtual=%ux%u bpp=%u stride=%u rgba=%u/%u,%u/%u,%u/%u,%u/%u\n",
+            sDirectFb.var.xres, sDirectFb.var.yres, sDirectFb.var.xres_virtual, sDirectFb.var.yres_virtual,
+            sDirectFb.var.bits_per_pixel, sDirectFb.fix.line_length, sDirectFb.var.red.offset,
+            sDirectFb.var.red.length, sDirectFb.var.green.offset, sDirectFb.var.green.length,
+            sDirectFb.var.blue.offset, sDirectFb.var.blue.length, sDirectFb.var.transp.offset,
+            sDirectFb.var.transp.length);
+    return true;
+}
+
+static void Port_PPU_PresentDirectFb(const uint32_t* src, int srcW, int srcH, int srcPitchBytes) {
+    if (!Port_PPU_DirectFbInit() || src == nullptr || srcW <= 0 || srcH <= 0)
+        return;
+    /* SDL's evdev presenter may page-flip, so refresh the visible offset. */
+    ioctl(sDirectFb.fd, FBIOGET_VSCREENINFO, &sDirectFb.var);
+    const int fbW = (int)sDirectFb.var.xres;
+    const int fbH = (int)sDirectFb.var.yres;
+    const int bytesPerPixel = (int)sDirectFb.var.bits_per_pixel / 8;
+    int dstW = fbW;
+    int dstH = (fbW * srcH) / srcW;
+    if (dstH > fbH) {
+        dstH = fbH;
+        dstW = (fbH * srcW) / srcH;
+    }
+    const int dstX = (fbW - dstW) / 2;
+    const int dstY = (fbH - dstH) / 2;
+    const size_t pageOffset = (size_t)sDirectFb.var.yoffset * sDirectFb.fix.line_length +
+                              (size_t)sDirectFb.var.xoffset * (size_t)bytesPerPixel;
+    if (pageOffset >= sDirectFb.size)
+        return;
+    uint8_t* page = sDirectFb.pixels + pageOffset;
+    const size_t visibleBytes = (size_t)fbH * sDirectFb.fix.line_length;
+    if (pageOffset + visibleBytes <= sDirectFb.size)
+        std::memset(page, 0, visibleBytes);
+
+    const int srcPitch = srcPitchBytes / (int)sizeof(uint32_t);
+    for (int dy = 0; dy < dstH; ++dy) {
+        const int sy = (dy * srcH) / dstH;
+        const uint32_t* srcRow = src + (size_t)sy * (size_t)srcPitch;
+        uint8_t* dstRow = page + (size_t)(dstY + dy) * sDirectFb.fix.line_length +
+                          (size_t)dstX * (size_t)bytesPerPixel;
+        for (int dx = 0; dx < dstW; ++dx) {
+            const uint32_t p = srcRow[(dx * srcW) / dstW];
+            const uint8_t r = (uint8_t)p;
+            const uint8_t g = (uint8_t)(p >> 8);
+            const uint8_t b = (uint8_t)(p >> 16);
+            uint32_t packed = Port_PPU_FbComponent(r, sDirectFb.var.red) |
+                              Port_PPU_FbComponent(g, sDirectFb.var.green) |
+                              Port_PPU_FbComponent(b, sDirectFb.var.blue);
+            if (sDirectFb.var.transp.length)
+                packed |= Port_PPU_FbComponent(255, sDirectFb.var.transp);
+            if (bytesPerPixel == 2)
+                reinterpret_cast<uint16_t*>(dstRow)[dx] = (uint16_t)packed;
+            else
+                reinterpret_cast<uint32_t*>(dstRow)[dx] = packed;
+        }
+    }
+}
+#else
+static void Port_PPU_PresentDirectFb(const uint32_t*, int, int, int) {}
+#endif
 
 static int Port_PPU_WindowBaseWidth(void) {
     return (MODE1_GBA_WIDTH > 240 && Port_Config_WidescreenEnabled()) ? MODE1_GBA_WIDTH : 240;
@@ -1720,6 +1842,7 @@ extern "C" void Port_PPU_PresentFrame(void) {
                 fprintf(stderr, "[ppu] SDL_RenderPresent FAILED: %s\n", SDL_GetError());
             }
         }
+        Port_PPU_PresentDirectFb(presentFrame, presentW, presentH, presentPitchBytes);
         return;
     }
 
@@ -1900,6 +2023,16 @@ extern "C" bool Port_PPU_OverlaysUseRenderer(void) {
 }
 
 extern "C" void Port_PPU_Shutdown(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (sDirectFb.pixels != nullptr) {
+        munmap(sDirectFb.pixels, sDirectFb.size);
+        sDirectFb.pixels = nullptr;
+    }
+    if (sDirectFb.fd >= 0) {
+        close(sDirectFb.fd);
+        sDirectFb.fd = -1;
+    }
+#endif
     if (sWindow && sBackend == RenderBackend::Surface) {
         SDL_DestroyWindowSurface(sWindow);
     }
